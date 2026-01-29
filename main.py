@@ -1,15 +1,15 @@
-import discord # type: ignore
-from discord.ext import commands, tasks # type: ignore
+import discord
+from discord.ext import commands, tasks
 import asyncio
 import io
 import sys
+import requests
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 
 # Import Local Modules
 import config
 import database as db
-import pubg_api # type: ignore
 import betting
 import video
 import utils
@@ -19,11 +19,37 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# ================= DIRECT API FUNCTIONS =================
+# We define these HERE so you don't need a separate pubg_api.py file
+def get_account_id(player_name):
+    url = f"https://api.pubg.com/shards/{config.PUBG_SHARD}/players?filter[playerNames]={player_name}"
+    response = requests.get(url, headers=config.HEADERS)
+    if response.status_code == 200:
+        data = response.json().get('data', [])
+        if data: return data[0]['id']
+    return None
+
+def get_recent_matches(account_id):
+    url = f"https://api.pubg.com/shards/{config.PUBG_SHARD}/players/{account_id}"
+    response = requests.get(url, headers=config.HEADERS)
+    if response.status_code == 200:
+        data = response.json().get('data', {})
+        return [m['id'] for m in data.get('relationships', {}).get('matches', {}).get('data', [])]
+    return []
+
+def get_match_details(match_id):
+    response = requests.get(f"https://api.pubg.com/shards/{config.PUBG_SHARD}/matches/{match_id}", headers=config.HEADERS)
+    return response.json() if response.status_code == 200 else None
+
+def fetch_telemetry(url):
+    if not url: return None
+    return requests.get(url, headers={"Accept-Encoding": "gzip"}).json()
+
 # ================= MATCH LOGIC =================
 async def process_match(match_id, force_db_update=False, target_account_id=None, target_player_name=None):
     if force_db_update and db.is_match_processed(match_id): force_db_update = False
     
-    m_data = pubg_api.get_match_details(match_id)
+    m_data = get_match_details(match_id)
     if not m_data: return None
 
     # URL Check
@@ -78,11 +104,9 @@ async def process_match(match_id, force_db_update=False, target_account_id=None,
             stats = item.get('attributes', {}).get('stats', {})
             clan_participants.append({'name': stats.get('name'), 'id': stats.get('playerId'), 'stats': stats})
 
-    telemetry = pubg_api.fetch_telemetry(t_url)
+    telemetry = fetch_telemetry(t_url)
     trackers = {p['name']: {'blue_magnet':0, 'grenadier':0, 'undying':0, 'grave_robber':0, 'door_dasher':0, 'hoarder':0, 'shots_fired':0, 'shots_hit':0, 'leg_hits':0, 'snake_dist':0, 'traitor_dmg':0, 'masochist_dmg':0, 'sponge_dmg':0, 'junkie_boosts':0, 'boxer_dmg':0, 'vandal_tires':0, 'knocks_taken':0, 'thirst_dmg':0, 'killed_by_bot':False, 'weapon_stats': {}} for p in clan_participants}
     
-    
-
     # Telemetry Loop
     for event in telemetry:
         etype = event.get('_T')
@@ -138,6 +162,7 @@ async def process_match(match_id, force_db_update=False, target_account_id=None,
                 'revives': s.get('revives', 0),
                 'bot_deaths': 1 if t['killed_by_bot'] else 0,
                 'headshots': s.get('headshotKills', 0),
+                # === NEW: Save Damage Dealt for Duels ===
                 'damage_dealt': int(s.get('damageDealt', 0))
             }
         match_date = m_data['data']['attributes'].get('createdAt')
@@ -150,7 +175,9 @@ async def resolve_bets(data, match_id):
     active_bets = db.get_active_bets()
     if not active_bets: return None
 
-    # Logic
+    # Map player name to their damage in this match
+    dmg_map = {p['name']: int(p['stats'].get('damageDealt', 0)) for p in data['participants']}
+
     rank = 99
     for p in data['participants']:
         r = p['stats'].get('winPlace', 99)
@@ -161,7 +188,7 @@ async def resolve_bets(data, match_id):
 
     sorted_death = sorted(data['participants'], key=lambda x: x['stats'].get('timeSurvived', 9999))
     first_die_name = sorted_death[0]['name'] if sorted_death else "None"
-    dmg_map = {p['name']: int(p['stats'].get('damageDealt', 0)) for p in data['participants']}
+
     payouts = []
     for bet_id, uid, btype, target, amt in active_bets:
         winnings = 0
@@ -169,46 +196,36 @@ async def resolve_bets(data, match_id):
         refund = False
         target_clean = target.lower() if target else ""
         
-        # --- EXISTING BET TYPES ---
         if btype == "WIN" and rank == 1: winnings, won = amt * 10, True
         elif btype == "TOP10" and rank <= 10: winnings, won = amt * 2, True
         elif btype == "MOST_DMG" and target_clean == most_dmg_name.lower(): winnings, won = amt * 3, True
         elif btype == "FIRST_DIE" and target_clean == first_die_name.lower(): winnings, won = amt * 3, True
         
-        # --- NEW: PVP DUEL LOGIC ---
+        # === NEW: DUEL LOGIC ===
         elif btype.startswith("DUEL"):
-            # Format is "DUEL (2.5x)" and Target is "vs PlayerName"
-            # We need to parse the odds and the opponent name
             try:
-                # btype example: "DUEL (3.0x)" -> parse 3.0
-                odds_str = btype.split('(')[1].split('x')[0]
-                multiplier = float(odds_str)
+                # Format: "DUEL (2.5x)"
+                odds = float(btype.split('(')[1].split('x')[0])
+                # Target: "vs OpponentName"
+                opp_name = target.replace("vs ", "")
                 
-                # target example: "vs Usemaki06" -> parse Usemaki06
-                opponent_name = target.replace("vs ", "")
-                
-                # Get Bettor's PUBG Name
                 bettor_info = db.get_player_by_discord_id(uid)
                 bettor_name = bettor_info[0] if bettor_info else None
                 
-                # CHECK IF BOTH IN MATCH
-                if bettor_name not in dmg_map or opponent_name not in dmg_map:
-                    refund = True
-                else:
+                if bettor_name in dmg_map and opp_name in dmg_map:
                     my_dmg = dmg_map[bettor_name]
-                    opp_dmg = dmg_map[opponent_name]
-                    
+                    opp_dmg = dmg_map[opp_name]
                     if my_dmg > opp_dmg:
-                        winnings = int(amt * multiplier)
+                        winnings = int(amt * odds)
                         won = True
-                    # Else lost (or draw), no winnings
+                else:
+                    refund = True
             except:
-                refund = True # Safety net for parse errors
+                refund = True
 
-        # --- PAYOUT OR REFUND ---
         if refund:
-             db.update_balance(uid, amt)
-             payouts.append(f"↩️ <@{uid}> refunded **{amt}** (Player missing)")
+            db.update_balance(uid, amt)
+            payouts.append(f"↩️ <@{uid}> refunded **{amt}** (Player missing)")
         elif won:
             db.update_balance(uid, winnings)
             payouts.append(f"💸 <@{uid}> won **{winnings}**! ({btype})")
@@ -221,7 +238,6 @@ async def resolve_bets(data, match_id):
     return embed
 
 async def close_betting_logic(bot_instance):
-    """Closes bets and prints the summary."""
     db.set_game_state("betting_status", "LOCKED")
     
     channel_id = db.get_game_state('betting_channel')
@@ -265,9 +281,9 @@ async def auto_match_checker():
     candidate_matches = []
     
     for (did, acc_id, name) in players:
-        for m in pubg_api.get_recent_matches(acc_id)[:3]:
+        for m in get_recent_matches(acc_id)[:3]:
             if not db.is_match_processed(m):
-                m_details = pubg_api.get_match_details(m)
+                m_details = get_match_details(m)
                 if not m_details: continue
                 created_at_str = m_details['data']['attributes']['createdAt']
                 created_at = datetime.strptime(created_at_str, "%Y-%m-%dT%H:%M:%SZ")
@@ -304,7 +320,7 @@ async def auto_match_checker():
 # ================= COMMANDS =================
 @bot.command()
 async def register(ctx, pubg_name: str):
-    acc_id = pubg_api.get_account_id(pubg_name)
+    acc_id = get_account_id(pubg_name)
     if acc_id:
         db.register_user(ctx.author.id, pubg_name, acc_id)
         db.update_balance(ctx.author.id, 0)
@@ -348,7 +364,7 @@ async def startbets(ctx):
     db.set_game_state("betting_start_time", datetime.utcnow())
     db.clear_active_bets()
     
-    embed = discord.Embed(title="🎰 Place Your Bets!", description="Betting is OPEN for the next match.\n\n🍗 **Win:** 10x\n🔟 **Top 10:** 2x\n💀 **First Die:** 3x\n💥 **Most Dmg:** 3x", color=0xf1c40f)
+    embed = discord.Embed(title="🎰 Place Your Bets!", description="Betting is OPEN for the next match.\n\n🍗 **Win:** 10x\n🔟 **Top 10:** 2x\n💀 **First Die:** 3x\n💥 **Most Dmg:** 3x\n⚔️ **Duel:** vs Player", color=0xf1c40f)
     await ctx.send(embed=embed, view=betting.BettingView())
     
     await asyncio.sleep(300)
@@ -369,14 +385,14 @@ async def report(ctx, username: str = None):
     if username:
         local = db.get_player_by_name_fuzzy(username)
         if local: target_name, target_id = local
-        else: target_id = pubg_api.get_account_id(username)
+        else: target_id = get_account_id(username)
         if not target_id: return await status.edit(content=f"❌ Player `{username}` not found.")
     else:
         user = db.get_player_by_discord_id(ctx.author.id)
         if not user: return await status.edit(content="❌ Register first!")
         target_name, target_id = user[0], user[1]
 
-    matches = pubg_api.get_recent_matches(target_id)
+    matches = get_recent_matches(target_id)
     data = None
     for mid in matches[:5]:
         save = True if not username else False 
@@ -402,7 +418,7 @@ async def video(ctx):
     status = await ctx.send("🎬 **Generating Video...**")
     user = db.get_player_by_discord_id(ctx.author.id)
     if not user: return await status.edit(content="❌ Register first!")
-    matches = pubg_api.get_recent_matches(user[1])
+    matches = get_recent_matches(user[1])
     data = None
     for mid in matches[:5]:
         data = await process_match(mid, target_account_id=user[1])
@@ -423,10 +439,10 @@ async def trend(ctx):
     user = db.get_player_by_discord_id(ctx.author.id)
     if not user: return await ctx.send("❌ Register first!")
     status = await ctx.send("📈 **Generating Trend...**")
-    matches = pubg_api.get_recent_matches(user[1])[:10]
+    matches = get_recent_matches(user[1])[:10]
     kills, dmg = [], []
     for mid in matches:
-        m = pubg_api.get_match_details(mid)
+        m = get_match_details(mid)
         if not m: continue
         for i in m.get('included', []):
             if i.get('type') == 'participant' and i.get('attributes', {}).get('stats', {}).get('playerId') == user[1]:
@@ -480,7 +496,7 @@ async def gun(ctx):
     user = db.get_player_by_discord_id(ctx.author.id)
     if not user: return await ctx.send("❌ Register first!")
     status = await ctx.send("🔫 **Analyzing...**")
-    matches = pubg_api.get_recent_matches(user[1])
+    matches = get_recent_matches(user[1])
     data = None
     for mid in matches[:5]:
         data = await process_match(mid, target_account_id=user[1])
@@ -497,7 +513,7 @@ async def refresh(ctx):
     players = db.get_all_players()
     count = 0
     for (did, acc_id, name) in players:
-        for m in pubg_api.get_recent_matches(acc_id)[:10]:
+        for m in get_recent_matches(acc_id)[:10]:
             if not db.is_match_processed(m):
                 await process_match(m, force_db_update=True, target_account_id=acc_id)
                 count += 1
