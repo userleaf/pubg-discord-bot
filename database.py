@@ -92,3 +92,16 @@ def get_game_state(key):
     with get_connection() as conn:
         res = conn.execute("SELECT value FROM game_state WHERE key=?", (key,)).fetchone()
     return res[0] if res else None
+def get_player_avg_damage(pubg_name):
+    """Calculates average damage over the last 10 tracked matches."""
+    with get_connection() as conn:
+        # Get last 10 damage values
+        rows = conn.execute('''
+            SELECT value FROM match_stats 
+            WHERE pubg_name=? AND stat_key='damage_dealt' 
+            ORDER BY match_date DESC LIMIT 10
+        ''', (pubg_name,)).fetchall()
+    
+    if not rows: return 0
+    total = sum(r[0] for r in rows)
+    return total / len(rows)

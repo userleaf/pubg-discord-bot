@@ -25,7 +25,9 @@ LEADERBOARD_CONFIG = {
     'distance_driven': ('Uber Driver', 'm Driven'),
     'revives':         ('Medic', 'Revives'),
     'bot_deaths':      ('Bot Food', 'Deaths to AI'),
-    'headshots':       ('Brain Surgeon', 'Headshots')
+    'headshots':       ('Brain Surgeon', 'Headshots'),
+    'damage_dealt':    ('Damage Dealer', 'Damage')
+
 }
 
 # Stat Weights & Normalization (Value, Weight)

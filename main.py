@@ -1,5 +1,5 @@
-import discord
-from discord.ext import commands, tasks
+import discord # type: ignore
+from discord.ext import commands, tasks # type: ignore
 import asyncio
 import io
 import sys
@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 # Import Local Modules
 import config
 import database as db
-import pubg_api
+import pubg_api # type: ignore
 import betting
 import video
 import utils
@@ -81,6 +81,8 @@ async def process_match(match_id, force_db_update=False, target_account_id=None,
     telemetry = pubg_api.fetch_telemetry(t_url)
     trackers = {p['name']: {'blue_magnet':0, 'grenadier':0, 'undying':0, 'grave_robber':0, 'door_dasher':0, 'hoarder':0, 'shots_fired':0, 'shots_hit':0, 'leg_hits':0, 'snake_dist':0, 'traitor_dmg':0, 'masochist_dmg':0, 'sponge_dmg':0, 'junkie_boosts':0, 'boxer_dmg':0, 'vandal_tires':0, 'knocks_taken':0, 'thirst_dmg':0, 'killed_by_bot':False, 'weapon_stats': {}} for p in clan_participants}
     
+    
+
     # Telemetry Loop
     for event in telemetry:
         etype = event.get('_T')
@@ -135,7 +137,8 @@ async def process_match(match_id, force_db_update=False, target_account_id=None,
                 'distance_driven': int(s.get('rideDistance', 0)),
                 'revives': s.get('revives', 0),
                 'bot_deaths': 1 if t['killed_by_bot'] else 0,
-                'headshots': s.get('headshotKills', 0)
+                'headshots': s.get('headshotKills', 0),
+                'damage_dealt': int(s.get('damageDealt', 0))
             }
         match_date = m_data['data']['attributes'].get('createdAt')
         db.save_match_stats(match_id, match_date, stats_to_save)
@@ -158,19 +161,55 @@ async def resolve_bets(data, match_id):
 
     sorted_death = sorted(data['participants'], key=lambda x: x['stats'].get('timeSurvived', 9999))
     first_die_name = sorted_death[0]['name'] if sorted_death else "None"
-
+    dmg_map = {p['name']: int(p['stats'].get('damageDealt', 0)) for p in data['participants']}
     payouts = []
     for bet_id, uid, btype, target, amt in active_bets:
         winnings = 0
         won = False
+        refund = False
         target_clean = target.lower() if target else ""
         
+        # --- EXISTING BET TYPES ---
         if btype == "WIN" and rank == 1: winnings, won = amt * 10, True
         elif btype == "TOP10" and rank <= 10: winnings, won = amt * 2, True
         elif btype == "MOST_DMG" and target_clean == most_dmg_name.lower(): winnings, won = amt * 3, True
         elif btype == "FIRST_DIE" and target_clean == first_die_name.lower(): winnings, won = amt * 3, True
-            
-        if won:
+        
+        # --- NEW: PVP DUEL LOGIC ---
+        elif btype.startswith("DUEL"):
+            # Format is "DUEL (2.5x)" and Target is "vs PlayerName"
+            # We need to parse the odds and the opponent name
+            try:
+                # btype example: "DUEL (3.0x)" -> parse 3.0
+                odds_str = btype.split('(')[1].split('x')[0]
+                multiplier = float(odds_str)
+                
+                # target example: "vs Usemaki06" -> parse Usemaki06
+                opponent_name = target.replace("vs ", "")
+                
+                # Get Bettor's PUBG Name
+                bettor_info = db.get_player_by_discord_id(uid)
+                bettor_name = bettor_info[0] if bettor_info else None
+                
+                # CHECK IF BOTH IN MATCH
+                if bettor_name not in dmg_map or opponent_name not in dmg_map:
+                    refund = True
+                else:
+                    my_dmg = dmg_map[bettor_name]
+                    opp_dmg = dmg_map[opponent_name]
+                    
+                    if my_dmg > opp_dmg:
+                        winnings = int(amt * multiplier)
+                        won = True
+                    # Else lost (or draw), no winnings
+            except:
+                refund = True # Safety net for parse errors
+
+        # --- PAYOUT OR REFUND ---
+        if refund:
+             db.update_balance(uid, amt)
+             payouts.append(f"↩️ <@{uid}> refunded **{amt}** (Player missing)")
+        elif won:
             db.update_balance(uid, winnings)
             payouts.append(f"💸 <@{uid}> won **{winnings}**! ({btype})")
 
