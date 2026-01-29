@@ -20,7 +20,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # ================= DIRECT API FUNCTIONS =================
-# We define these HERE so you don't need a separate pubg_api.py file
+# These remain normal synchronous functions
 def get_account_id(player_name):
     url = f"https://api.pubg.com/shards/{config.PUBG_SHARD}/players?filter[playerNames]={player_name}"
     response = requests.get(url, headers=config.HEADERS)
@@ -45,11 +45,18 @@ def fetch_telemetry(url):
     if not url: return None
     return requests.get(url, headers={"Accept-Encoding": "gzip"}).json()
 
+# === NEW HELPER: Runs blocking downloads in a background thread ===
+async def run_blocking(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args)
+
 # ================= MATCH LOGIC =================
 async def process_match(match_id, force_db_update=False, target_account_id=None, target_player_name=None):
-    #if force_db_update and db.is_match_processed(match_id): force_db_update = False
+    # REMOVED the check that prevents re-processing so !refresh works
+    # if force_db_update and db.is_match_processed(match_id): force_db_update = False
     
-    m_data = get_match_details(match_id)
+    # === CHANGED: Use await run_blocking() to prevent freezing ===
+    m_data = await run_blocking(get_match_details, match_id)
     if not m_data: return None
 
     # URL Check
@@ -104,7 +111,9 @@ async def process_match(match_id, force_db_update=False, target_account_id=None,
             stats = item.get('attributes', {}).get('stats', {})
             clan_participants.append({'name': stats.get('name'), 'id': stats.get('playerId'), 'stats': stats})
 
-    telemetry = fetch_telemetry(t_url)
+    # === CHANGED: Use await run_blocking() to prevent freezing ===
+    telemetry = await run_blocking(fetch_telemetry, t_url)
+    
     trackers = {p['name']: {'blue_magnet':0, 'grenadier':0, 'undying':0, 'grave_robber':0, 'door_dasher':0, 'hoarder':0, 'shots_fired':0, 'shots_hit':0, 'leg_hits':0, 'snake_dist':0, 'traitor_dmg':0, 'masochist_dmg':0, 'sponge_dmg':0, 'junkie_boosts':0, 'boxer_dmg':0, 'vandal_tires':0, 'knocks_taken':0, 'thirst_dmg':0, 'killed_by_bot':False, 'weapon_stats': {}} for p in clan_participants}
     
     # Telemetry Loop
@@ -162,7 +171,6 @@ async def process_match(match_id, force_db_update=False, target_account_id=None,
                 'revives': s.get('revives', 0),
                 'bot_deaths': 1 if t['killed_by_bot'] else 0,
                 'headshots': s.get('headshotKills', 0),
-                # === NEW: Save Damage Dealt for Duels ===
                 'damage_dealt': int(s.get('damageDealt', 0))
             }
         match_date = m_data['data']['attributes'].get('createdAt')
@@ -201,7 +209,7 @@ async def resolve_bets(data, match_id):
         elif btype == "MOST_DMG" and target_clean == most_dmg_name.lower(): winnings, won = amt * 3, True
         elif btype == "FIRST_DIE" and target_clean == first_die_name.lower(): winnings, won = amt * 3, True
         
-        # === NEW: DUEL LOGIC ===
+        # === DUEL LOGIC ===
         elif btype.startswith("DUEL"):
             try:
                 # Format: "DUEL (2.5x)"
@@ -281,9 +289,11 @@ async def auto_match_checker():
     candidate_matches = []
     
     for (did, acc_id, name) in players:
+        # ASYNC BLOCKING CALL WRAPPER NOT NEEDED HERE as getting match list is fast, 
+        # but to be safe we could wrap it. For now, leave as is, the big one is telemetry.
         for m in get_recent_matches(acc_id)[:3]:
             if not db.is_match_processed(m):
-                m_details = get_match_details(m)
+                m_details = await run_blocking(get_match_details, m)
                 if not m_details: continue
                 created_at_str = m_details['data']['attributes']['createdAt']
                 created_at = datetime.strptime(created_at_str, "%Y-%m-%dT%H:%M:%SZ")
@@ -320,7 +330,7 @@ async def auto_match_checker():
 # ================= COMMANDS =================
 @bot.command()
 async def register(ctx, pubg_name: str):
-    acc_id = get_account_id(pubg_name)
+    acc_id = await run_blocking(get_account_id, pubg_name)
     if acc_id:
         db.register_user(ctx.author.id, pubg_name, acc_id)
         db.update_balance(ctx.author.id, 0)
@@ -385,14 +395,14 @@ async def report(ctx, username: str = None):
     if username:
         local = db.get_player_by_name_fuzzy(username)
         if local: target_name, target_id = local
-        else: target_id = get_account_id(username)
+        else: target_id = await run_blocking(get_account_id, username)
         if not target_id: return await status.edit(content=f"❌ Player `{username}` not found.")
     else:
         user = db.get_player_by_discord_id(ctx.author.id)
         if not user: return await status.edit(content="❌ Register first!")
         target_name, target_id = user[0], user[1]
 
-    matches = get_recent_matches(target_id)
+    matches = await run_blocking(get_recent_matches, target_id)
     data = None
     for mid in matches[:5]:
         save = True if not username else False 
@@ -418,14 +428,14 @@ async def video(ctx):
     status = await ctx.send("🎬 **Generating Video...**")
     user = db.get_player_by_discord_id(ctx.author.id)
     if not user: return await status.edit(content="❌ Register first!")
-    matches = get_recent_matches(user[1])
+    matches = await run_blocking(get_recent_matches, user[1])
     data = None
     for mid in matches[:5]:
         data = await process_match(mid, target_account_id=user[1])
         if data: break
     if data:
         summary, highlights, rank = utils.calculate_highlights_and_summary(data)
-        path = video.generate_video_report(summary, highlights, rank, data['map'])
+        path = await run_blocking(video.generate_video_report, summary, highlights, rank, data['map'])
         if path:
             await status.delete()
             await ctx.send(file=discord.File(path))
@@ -439,10 +449,10 @@ async def trend(ctx):
     user = db.get_player_by_discord_id(ctx.author.id)
     if not user: return await ctx.send("❌ Register first!")
     status = await ctx.send("📈 **Generating Trend...**")
-    matches = get_recent_matches(user[1])[:10]
+    matches = await run_blocking(get_recent_matches, user[1])
     kills, dmg = [], []
-    for mid in matches:
-        m = get_match_details(mid)
+    for mid in matches[:10]:
+        m = await run_blocking(get_match_details, mid)
         if not m: continue
         for i in m.get('included', []):
             if i.get('type') == 'participant' and i.get('attributes', {}).get('stats', {}).get('playerId') == user[1]:
@@ -451,20 +461,26 @@ async def trend(ctx):
                 dmg.append(s.get('damageDealt', 0))
                 break
     kills.reverse(); dmg.reverse()
-    fig, ax1 = plt.subplots()
-    color = 'tab:red'
-    ax1.set_xlabel('Matches')
-    ax1.set_ylabel('Damage', color=color)
-    ax1.plot(dmg, color=color, marker='o'); ax1.tick_params(axis='y', labelcolor=color)
-    ax2 = ax1.twinx()
-    color = 'tab:blue'
-    ax2.set_ylabel('Kills', color=color)
-    ax2.plot(kills, color=color, marker='x', linestyle='--'); ax2.tick_params(axis='y', labelcolor=color)
-    plt.title(f"Trend: {user[0]}")
-    fig.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
+    
+    # Matplotlib must run in thread too
+    def create_plot():
+        fig, ax1 = plt.subplots()
+        color = 'tab:red'
+        ax1.set_xlabel('Matches')
+        ax1.set_ylabel('Damage', color=color)
+        ax1.plot(dmg, color=color, marker='o'); ax1.tick_params(axis='y', labelcolor=color)
+        ax2 = ax1.twinx()
+        color = 'tab:blue'
+        ax2.set_ylabel('Kills', color=color)
+        ax2.plot(kills, color=color, marker='x', linestyle='--'); ax2.tick_params(axis='y', labelcolor=color)
+        plt.title(f"Trend: {user[0]}")
+        fig.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        return buf
+
+    buf = await run_blocking(create_plot)
     await status.delete()
     await ctx.send(file=discord.File(buf, 'trend.png'))
 
@@ -496,7 +512,7 @@ async def gun(ctx):
     user = db.get_player_by_discord_id(ctx.author.id)
     if not user: return await ctx.send("❌ Register first!")
     status = await ctx.send("🔫 **Analyzing...**")
-    matches = get_recent_matches(user[1])
+    matches = await run_blocking(get_recent_matches, user[1])
     data = None
     for mid in matches[:5]:
         data = await process_match(mid, target_account_id=user[1])
@@ -513,10 +529,14 @@ async def refresh(ctx):
     players = db.get_all_players()
     count = 0
     for (did, acc_id, name) in players:
-        for m in get_recent_matches(acc_id)[:15]:
+        # Scan last 15 matches to safely backfill damage stats
+        matches = await run_blocking(get_recent_matches, acc_id)
+        for m in matches[:15]:
+            # Always process regardless of DB state to fill missing damage data
             await process_match(m, force_db_update=True, target_account_id=acc_id)
             count += 1
-    await status.edit(content=f"✅ **Done!** Processed {count} historic matches.")
+            
+    await status.edit(content=f"✅ **Damage Data Restored!** Rescanned {count} matches.")
 
 if __name__ == '__main__':
     if sys.platform == 'win32':
