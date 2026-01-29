@@ -47,7 +47,7 @@ def fetch_telemetry(url):
 
 # ================= MATCH LOGIC =================
 async def process_match(match_id, force_db_update=False, target_account_id=None, target_player_name=None):
-    if force_db_update and db.is_match_processed(match_id): force_db_update = False
+    #if force_db_update and db.is_match_processed(match_id): force_db_update = False
     
     m_data = get_match_details(match_id)
     if not m_data: return None
@@ -509,14 +509,13 @@ async def gun(ctx):
 
 @bot.command()
 async def refresh(ctx):
-    status = await ctx.send("🔄 **Refreshing...**")
+    status = await ctx.send("🔄 **Force Refreshing All Stats...** (This will take a moment)")
     players = db.get_all_players()
     count = 0
     for (did, acc_id, name) in players:
-        for m in get_recent_matches(acc_id)[:10]:
-            if not db.is_match_processed(m):
-                await process_match(m, force_db_update=True, target_account_id=acc_id)
-                count += 1
+        for m in get_recent_matches(acc_id)[:15]:
+            await process_match(m, force_db_update=True, target_account_id=acc_id)
+            count += 1
     await status.edit(content=f"✅ **Done!** Processed {count} historic matches.")
 
 if __name__ == '__main__':
