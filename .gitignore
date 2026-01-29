@@ -1,0 +1,23 @@
+# --- Security (CRITICAL) ---
+.env
+clan.db
+clan.db-journal
+*.log
+
+# --- Python Artifacts ---
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+venv/
+.pytest_cache/
+
+# --- Generated Media ---
+# We ignore these because they are generated dynamically or are large templates
+match_reel.mp4
+trend.png
+
+# --- OS Files ---
+.DS_Store
+Thumbs.db

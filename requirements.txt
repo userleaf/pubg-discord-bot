@@ -1,0 +1,7 @@
+discord.py
+python-dotenv
+requests
+moviepy
+Pillow
+matplotlib
+numpy
