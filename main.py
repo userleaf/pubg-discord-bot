@@ -13,7 +13,11 @@ import database as db
 import betting
 import video
 import utils
+import os
+import random
 
+# MUST match the symbols used in your generator script
+SYMBOLS = ['🍒', '🍋', '🍇', '💎', '🔔']
 # ================= SETUP =================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -266,11 +270,79 @@ async def close_betting_logic(bot_instance):
     channel = bot_instance.get_channel(int(channel_id))
     if channel: await channel.send(embed=embed)
 
+
+class CasinoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None) 
+
+    @discord.ui.button(label="🎰 SPIN (100c)", style=discord.ButtonStyle.success, custom_id="casino_spin_btn")
+    async def spin_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        
+        # 1. Money Check
+        if db.get_balance(user_id) < 100:
+            return await interaction.response.send_message("❌ **Insufficient funds!**", ephemeral=True)
+        db.update_balance(user_id, -100)
+        
+        # 2. Calculate Result
+        s1 = random.choice(SYMBOLS)
+        s2 = random.choice(SYMBOLS)
+        s3 = random.choice(SYMBOLS)
+        
+        # 3. File Paths
+        filename_base = f"{s1}_{s2}_{s3}"
+        gif_path = os.path.join("slot_gifs", f"{filename_base}.gif")
+        png_path = os.path.join("slot_gifs", f"{filename_base}.png")
+        
+        # 4. Send GIF (Animation)
+        if os.path.exists(gif_path):
+            file = discord.File(gif_path, filename="spin.gif")
+            await interaction.response.send_message(content="🎰 **Spinning...**", file=file, ephemeral=True)
+        else:
+            await interaction.response.send_message(content="❌ Error: Missing assets.", ephemeral=True)
+            return
+
+        # 5. Wait for Animation (2.5 seconds)
+        # This covers the spin time + part of the "pause" at the end of the GIF
+        await asyncio.sleep(2.5)
+        
+        # 6. Calculate Winnings Text
+        winnings = 0
+        status_text = "Better luck next time."
+        
+        if s1 == s2 == s3:
+            if s1 == '🔔': 
+                winnings = 5000
+                status_text = "🚨 **JACKPOT!** (+5000)"
+            else: 
+                winnings = 1000
+                status_text = "🏆 **TRIPLE!** (+1000)"
+        elif s1 == s2 or s2 == s3 or s1 == s3:
+            winnings = 200
+            status_text = "✨ **PAIR!** (+200)"
+
+        if winnings > 0:
+            db.update_balance(user_id, winnings)
+
+        # 7. THE SWAP (GIF -> PNG)
+        # We upload the PNG and replace the message attachments
+        if os.path.exists(png_path):
+            new_file = discord.File(png_path, filename="result.png")
+            
+            # Edit the ORIGINAL message:
+            # - Update text to show result
+            # - Replace GIF with PNG
+            await interaction.edit_original_response(
+                content=f"🎰 **RESULT:**\n{status_text}", 
+                attachments=[new_file]
+            )
+
 # ================= EVENTS & TASKS =================
 @bot.event
 async def on_ready():
     print(f'✅ Logged in as {bot.user}')
     db.init_db()
+    bot.add_view(CasinoView())
     if not auto_match_checker.is_running(): auto_match_checker.start()
 
 @tasks.loop(minutes=config.CFG_MINUTES)
@@ -537,6 +609,12 @@ async def refresh(ctx):
             count += 1
             
     await status.edit(content=f"✅ **Damage Data Restored!** Rescanned {count} matches.")
+
+@bot.command()
+async def casino(ctx):
+    # Spawn the persistent Arcade Machine
+    embed = discord.Embed(title="🎰 CLAN CASINO", description="Press the button to play!\n**Cost:** 100 coins\n\n**Payouts:**\n🔔🔔🔔 = **5000**\n🍒🍒🍒 = **1000**\n🍒🍒❓ = **200**", color=0xf1c40f)
+    await ctx.send(embed=embed, view=CasinoView())
 
 if __name__ == '__main__':
     if sys.platform == 'win32':
