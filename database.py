@@ -177,3 +177,53 @@ def get_player_avg_damage(pubg_name):
     if not rows: return 0
     total = sum(r[0] for r in rows)
     return total / len(rows)
+
+def get_player_avg_damage(player_name, limit=10):
+    conn = get_connection()
+    # We look at the JSON stats stored in match_stats
+    cursor = conn.execute("SELECT stats_json FROM match_stats ORDER BY match_date DESC LIMIT 50")
+    rows = cursor.fetchall()
+    conn.close()
+
+    total_dmg = 0
+    count = 0
+    
+    import json
+    for (json_data,) in rows:
+        if count >= limit: break
+        try:
+            stats = json.loads(json_data)
+            # Check if this player was in this specific match
+            if player_name in stats:
+                total_dmg += stats[player_name].get('damage_dealt', 0)
+                count += 1
+        except:
+            continue
+            
+    if count == 0: return 0
+    return int(total_dmg / count)
+
+def check_daily_available(user_id):
+    conn = get_connection()
+    cursor = conn.execute("SELECT last_daily FROM wallets WHERE discord_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row or not row[0]: return True # Never claimed
+    
+    last_claim_str = row[0]
+    try:
+        # Parse the timestamp
+        # Handle formats with or without microseconds just in case
+        if "." in last_claim_str:
+            last_date = datetime.strptime(last_claim_str, "%Y-%m-%d %H:%M:%S.%f").date()
+        else:
+            last_date = datetime.strptime(last_claim_str, "%Y-%m-%d %H:%M:%S").date()
+            
+        today_date = datetime.now().date()
+        
+        # If last claim was yesterday (or earlier), return True
+        return today_date > last_date
+    except Exception as e:
+        print(f"Date Error: {e}")
+        return True
