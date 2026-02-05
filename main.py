@@ -689,18 +689,28 @@ async def refresh(ctx):
 async def break_time(ctx, minutes: int):
     """Usage: !break 5 (Sets a 5 minute timer)"""
     
-    # Send confirmation
-    end_time = datetime.now() + timedelta(minutes=minutes)
+    # 1. Calculate End Time
+    now = datetime.now()
+    end_time = now + timedelta(minutes=minutes)
     time_str = end_time.strftime("%H:%M")
     
+    # 2. Send Start Message
+    print(f"⏱️ Break started for {minutes} minutes.")
     await ctx.send(f"☕ **Break Started!**\nWe will be back in **{minutes} minutes** (at {time_str}).")
     
-    # Wait
+    # 3. The Wait (Non-blocking)
+    # The bot stays awake and listens to other commands while this runs in background
     await asyncio.sleep(minutes * 60)
     
-    # Announce return
-    await ctx.send(f"🔔 **BREAK OVER!**\n<@&{config.CLAN_ROLE_ID}> Let's get back to the game!") 
-    # (If you don't have a CLAN_ROLE_ID in config, just use @here)
+    # 4. Send End Message
+    # We use @here to alert everyone online
+    print("🔔 Break is over!")
+    try:
+        await ctx.send(f"🔔 **BREAK OVER!**\n@here Let's get back to the game!") 
+    except Exception as e:
+        print(f"⚠️ Error sending break message: {e}")
+        # Fallback if pinging fails
+        await ctx.send("🔔 **BREAK OVER!** (Time is up)")
 
 @bot.command()
 async def casino(ctx):
