@@ -15,6 +15,8 @@ HEADERS = {
 
 # Bot Settings
 CFG_MINUTES = 2  # How often auto-checker runs
+ADMIN_ID = 503564916838367234
+MAIN_CHANNEL_ID = 1459872192396525713
 
 # Stats Configuration
 LEADERBOARD_CONFIG = {

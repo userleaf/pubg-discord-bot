@@ -22,7 +22,6 @@ SYMBOLS = ['🍒', '🍋', '🍇', '💎', '🔔']
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-
 # ================= DIRECT API FUNCTIONS =================
 # These remain normal synchronous functions
 def get_account_id(player_name):
@@ -615,6 +614,152 @@ async def casino(ctx):
     # Spawn the persistent Arcade Machine
     embed = discord.Embed(title="🎰 CLAN CASINO", description="Press the button to play!\n**Cost:** 100 coins\n\n**Payouts:**\n🔔🔔🔔 = **5000**\n🍒🍒🍒 = **1000**\n🍒🍒❓ = **200**", color=0xf1c40f)
     await ctx.send(embed=embed, view=CasinoView())
+
+# ================= ADMIN COMMANDS =================
+
+def is_admin(ctx):
+    # DEBUG PRINT: This will show up in your terminal every time you run an admin command
+    print(f"DEBUG: Command by {ctx.author.name} (ID: {ctx.author.id})")
+    print(f"DEBUG: Checking against Config ID: {config.ADMIN_ID}")
+    
+    # Check ID match
+    if ctx.author.id == config.ADMIN_ID:
+        return True
+    
+    # Fallback: Check Name match (legacy support)
+    # This handles both "Display Name" and "Username"
+    if ctx.author.name == "Usemaki06" or ctx.author.display_name == "Usemaki06":
+        return True
+        
+    return False
+
+@bot.command()
+@commands.check(is_admin)
+async def gift(ctx, target: str, amount: int, *, message: str = "Bonus!"):
+    """
+    Usage (in DM or Chat): !gift #all 100 Happy Monday!
+    """
+    
+    # 1. Determine where to send the announcement
+    if ctx.guild is None:
+        # If command came from DM, send result to the Main Channel
+        channel = bot.get_channel(config.MAIN_CHANNEL_ID)
+        if not channel:
+            await ctx.send("❌ Error: I can't find the main channel ID set in config.")
+            return
+    else:
+        # If command came from a server, send result to that same channel
+        channel = ctx.channel
+        # Optional: Try to delete the command message if in server
+        try: await ctx.message.delete()
+        except: pass
+
+    # 2. Logic (Same as before)
+    print(f"🎁 Gift triggered by {ctx.author.name}") 
+    
+    if target == "#all":
+        players = db.get_all_players()
+        count = 0
+        for (did, _, _) in players:
+            db.update_balance(did, amount)
+            count += 1
+        
+        embed = discord.Embed(title="🎁 CLAN GIFT", description=f"**{ctx.author.display_name}** sent **{amount}** coins to everyone!", color=0xe91e63)
+        embed.add_field(name="Message", value=message)
+        embed.set_footer(text=f"Sent to {count} members.")
+        
+        # SEND TO THE CHANNEL
+        await channel.send(embed=embed)
+        # Reply to Admin in DM confirming it worked
+        if ctx.guild is None:
+            await ctx.send(f"✅ Posted gift to #{channel.name}")
+
+    else:
+        # Single User Logic
+        conn = db.get_connection()
+        try:
+            converter = commands.MemberConverter()
+            member = await converter.convert(ctx, target) # This might fail in DMs if bot doesn't share server
+            cursor = conn.execute("SELECT discord_id FROM players WHERE discord_id=?", (member.id,))
+        except:
+            cursor = conn.execute("SELECT discord_id FROM players WHERE pubg_name LIKE ?", (f"%{target}%",))
+            
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            uid = row[0]
+            db.update_balance(uid, amount)
+            
+            # Construct the public message
+            # We fetch the Discord User object to tag them properly in the announcement
+            try:
+                receiver = await bot.fetch_user(uid)
+                receiver_tag = receiver.mention
+            except:
+                receiver_tag = target
+
+            await channel.send(f"🎁 **{ctx.author.display_name}** sent **{amount}** coins to {receiver_tag}.\n📝 *{message}*")
+            
+            if ctx.guild is None:
+                await ctx.send(f"✅ Sent {amount} to {target} in #{channel.name}")
+        else:
+            await ctx.send(f"❌ Could not find user `{target}`.")
+
+@bot.command()
+@commands.check(is_admin)
+async def freespin(ctx):
+    """!freespin - Gives 100 coins to everyone"""
+    print(f"🎰 Freespin triggered by {ctx.author.name}") # Debug output
+    players = db.get_all_players()
+    for (did, _, _) in players:
+        db.update_balance(did, 100)
+    
+    embed = discord.Embed(title="🎰 FREE SPIN ON THE HOUSE!", color=0xf1c40f)
+    embed.description = f"**{ctx.author.display_name}** just credited everyone **100 coins**!\nGo play the casino right now!"
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.check(is_admin)
+async def balances(ctx):
+    """!balances - Show leaderboard"""
+    print(f"💰 Balances triggered by {ctx.author.name}") # Debug output
+    conn = db.get_connection()
+    query = """
+    SELECT p.pubg_name, w.balance 
+    FROM wallets w 
+    JOIN players p ON w.discord_id = p.discord_id 
+    ORDER BY w.balance DESC
+    """
+    rows = conn.execute(query).fetchall()
+    conn.close()
+
+    if not rows:
+        return await ctx.send("❌ No balances found.")
+
+    desc = ""
+    total = 0
+    for idx, (name, bal) in enumerate(rows, 1):
+        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"**{idx}.**"
+        desc += f"{medal} **{name}**: {bal}\n"
+        total += bal
+
+    embed = discord.Embed(title="💰 Clan Treasury", description=desc, color=0x3498db)
+    embed.set_footer(text=f"Total Economy: {total}")
+    await ctx.send(embed=embed)
+
+# GLOBAL ERROR HANDLER FOR ADMIN CHECKS
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        # This catches the 'is_admin' failure
+        print(f"⛔ Access Denied for {ctx.author.name}")
+        await ctx.send("⛔ **Admin Only.** You are not authorized.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing argument! Usage: `{ctx.prefix}{ctx.command.name} {ctx.command.signature}`")
+    else:
+        # Print other errors to terminal so we see them
+        print(f"⚠️ Error: {error}")
 
 if __name__ == '__main__':
     if sys.platform == 'win32':
