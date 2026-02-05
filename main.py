@@ -345,58 +345,89 @@ async def on_ready():
     if not auto_match_checker.is_running(): auto_match_checker.start()
 
 @tasks.loop(minutes=config.CFG_MINUTES)
-async def auto_match_checker():
-    print("🔄 Checking matches...")
-    bet_status = db.get_game_state('betting_status')
-    start_time_str = db.get_game_state('betting_start_time')
-    bet_channel_id = db.get_game_state('betting_channel')
-    
-    bet_start_dt = None
-    if start_time_str:
-        try: bet_start_dt = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S.%f")
-        except: pass
 
+@tasks.loop(minutes=config.CFG_MINUTES)
+async def auto_match_checker():
+    # 1. GATHER CANDIDATES (Like the old code)
     players = db.get_all_players()
     candidate_matches = []
     
+    # Check what sessions are waiting for results
+    # Returns (session_id, start_time_string)
+    waiting_session = db.get_oldest_unresolved_session() 
+
     for (did, acc_id, name) in players:
-        # ASYNC BLOCKING CALL WRAPPER NOT NEEDED HERE as getting match list is fast, 
-        # but to be safe we could wrap it. For now, leave as is, the big one is telemetry.
-        for m in get_recent_matches(acc_id)[:3]:
+        # Get last 3 matches for every player
+        recent = await run_blocking(get_recent_matches, acc_id)
+        for m in recent[:3]:
             if not db.is_match_processed(m):
+                # Fetch details to get the TIME
                 m_details = await run_blocking(get_match_details, m)
                 if not m_details: continue
+                
                 created_at_str = m_details['data']['attributes']['createdAt']
-                created_at = datetime.strptime(created_at_str, "%Y-%m-%dT%H:%M:%SZ")
-                candidate_matches.append((created_at, m, acc_id))
+                m_time = datetime.strptime(created_at_str, "%Y-%m-%dT%H:%M:%SZ")
+                
+                # Add to list: (Time, MatchID, AccountID)
+                candidate_matches.append((m_time, m, acc_id))
 
+    # 2. SORT BY TIME (Oldest match first)
+    # This ensures we process history linearly
     candidate_matches.sort(key=lambda x: x[0])
 
+    # 3. ANALYZE MATCHES
     for (m_time, mid, acc_id) in candidate_matches:
+        # Double check it wasn't processed in a previous loop iteration
         if db.is_match_processed(mid): continue
         
+        # --- LOGIC: IS THIS A BETTING MATCH? ---
         is_betting_match = False
-        if bet_status == "LOCKED" and bet_start_dt:
-            if m_time > bet_start_dt:
-                is_betting_match = True
-                print(f"💰 Betting Match Found: {mid}")
+        
+        if waiting_session:
+            session_id = waiting_session[0]
+            session_start_str = waiting_session[1]
+            session_start = datetime.strptime(session_start_str, "%Y-%m-%d %H:%M:%S.%f")
+            
+            # TIME CHECK:
+            # 1. If match is OLDER than session start (-15 min buffer): 
+            #    It is an old game. Ignore for betting. Just save stats.
+            # 2. If match is NEWER than session start:
+            #    This is the game we are waiting for!
+            
+            if m_time < (session_start - timedelta(minutes=15)):
+                # Match happened BEFORE bets opened.
+                print(f"⚠️ Skipping Old Match {mid} (Too early for Session #{session_id})")
+                # We still process it below for stats, but is_betting_match stays False
             else:
-                print(f"⚠️ Skipping old match {mid}")
-                db.mark_match_processed(mid)
-                continue
+                # Match happened AFTER bets opened.
+                is_betting_match = True
+                print(f"💰 Betting Match Found for Session #{session_id}: {mid}")
 
+        # --- PROCESS THE MATCH ---
         print(f"🔄 Analyzing {mid}...")
         data = await process_match(mid, force_db_update=True, target_account_id=acc_id)
+        
+        # Mark processed immediately so we don't re-run it
         db.mark_match_processed(mid)
 
-        if is_betting_match and data:
-            print("💰 Resolving Bets...")
-            payout_embed = await resolve_bets(data, mid)
-            if payout_embed and bet_channel_id:
-                channel = bot.get_channel(int(bet_channel_id))
-                if channel: await channel.send(embed=payout_embed)
-            db.set_game_state("betting_status", "CLOSED")
-            break
+        # --- RESOLVE BETS (If applicable) ---
+        if is_betting_match and data and waiting_session:
+            session_id = waiting_session[0]
+            
+            print(f"💰 Payout Triggered for Session #{session_id}...")
+            payout_embed = await resolve_bets_for_session(data, session_id)
+            
+            # Post Result
+            channel_id = db.get_game_state('latest_betting_channel') or config.MAIN_CHANNEL_ID
+            channel = bot.get_channel(int(channel_id))
+            if channel: 
+                await channel.send(f"🔔 **Results for Round #{session_id}**", embed=payout_embed)
+            
+            # CLOSE THE SESSION PERMANENTLY
+            db.close_session(session_id, match_id=mid, status="RESOLVED")
+            
+            # Refresh waiting_session variable in case there is ANOTHER session waiting for the next match
+            waiting_session = db.get_oldest_unresolved_session()
 
 # ================= COMMANDS =================
 @bot.command()
@@ -417,40 +448,86 @@ async def balance(ctx):
 @bot.command()
 async def daily(ctx):
     user_id = ctx.author.id
+    
+    # 1. Check Availability (Midnight Reset)
+    if not db.check_daily_available(user_id):
+        # Calculate time until midnight
+        now = datetime.now()
+        tomorrow = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+        remaining = tomorrow - now
+        h, r = divmod(int(remaining.total_seconds()), 3600)
+        m, _ = divmod(r, 60)
+        return await ctx.send(f"⏳ **Already claimed today.**\nNext reward in: **{h}h {m}m** (Midnight).")
+
+    # 2. Calculate Bonus based on Performance
+    base_reward = 100
+    bonus = 0
+    avg_dmg = 0
+    
+    # Get player name to look up stats
+    player_data = db.get_player_by_discord_id(user_id) # returns (name, account_id)
+    
+    if player_data:
+        name = player_data[0]
+        avg_dmg = db.get_player_avg_damage(name, limit=10)
+        
+        # LOGIC: 50% of Average Damage, Capped at 200
+        # Example: 400 dmg -> 200 bonus
+        # Example: 100 dmg -> 50 bonus
+        bonus = int(avg_dmg * 0.5)
+        if bonus > 200: bonus = 200
+    
+    total_reward = base_reward + bonus
+    
+    # 3. Pay the user
+    db.update_balance(user_id, total_reward)
+    
+    # 4. Update "Last Daily" timestamp to NOW
     conn = db.get_connection()
-    row = conn.execute("SELECT last_daily FROM wallets WHERE discord_id=?", (user_id,)).fetchone()
-    now = datetime.now()
-    if row and row[0]:
-        try:
-            last = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S.%f")
-            delta = now - last
-            if delta < timedelta(hours=24):
-                wait = timedelta(hours=24) - delta
-                h, r = divmod(int(wait.total_seconds()), 3600)
-                m, _ = divmod(r, 60)
-                await ctx.send(f"⏳ Wait **{h}h {m}m**.")
-                conn.close()
-                return
-        except: pass
-    db.update_balance(user_id, 100)
-    conn.execute("UPDATE wallets SET last_daily = ? WHERE discord_id = ?", (now, user_id))
+    conn.execute("UPDATE wallets SET last_daily = ? WHERE discord_id = ?", (datetime.now(), user_id))
     conn.commit()
     conn.close()
-    await ctx.send(f"💰 **Cha-ching!** +100 coins.")
+    
+    # 5. Send Message
+    embed = discord.Embed(title="💰 Daily Reward", color=0x2ecc71)
+    embed.add_field(name="Base Reward", value=f"**{base_reward}** coins")
+    
+    if bonus > 0:
+        embed.add_field(name="Performance Bonus", value=f"**+{bonus}** coins\n*(Avg Dmg: {avg_dmg})*")
+    else:
+        embed.add_field(name="Performance Bonus", value="0 coins\n*(Play matches to increase this!)*")
+        
+    embed.set_footer(text=f"Total: +{total_reward} coins added to wallet.")
+    await ctx.send(embed=embed)
 
 @bot.command()
 async def startbets(ctx):
-    db.set_game_state("betting_status", "OPEN")
-    db.set_game_state("betting_channel", ctx.channel.id)
-    db.set_game_state("betting_start_time", datetime.utcnow())
-    db.clear_active_bets()
+    """Starts a NEW betting session (supports multiple active games)"""
     
-    embed = discord.Embed(title="🎰 Place Your Bets!", description="Betting is OPEN for the next match.\n\n🍗 **Win:** 10x\n🔟 **Top 10:** 2x\n💀 **First Die:** 3x\n💥 **Most Dmg:** 3x\n⚔️ **Duel:** vs Player", color=0xf1c40f)
-    await ctx.send(embed=embed, view=betting.BettingView())
+    # 1. Create a new Session in DB
+    session_id = db.create_betting_session()
     
+    # 2. Set the 'channel' state so we know where to post results for THIS session
+    # We can store this in game_state just for the "latest" channel
+    db.set_game_state("latest_betting_channel", ctx.channel.id)
+
+    embed = discord.Embed(title=f"🎰 Bets Open (Round #{session_id})", description="**New match starting!**\nPlace your bets now.", color=0xf1c40f)
+    embed.add_field(name="Multi-Game Support", value="You can bet on this game even if the previous one hasn't finished!")
+    
+    # Pass the session_id to the View so the buttons know which bucket to put money in
+    await ctx.send(embed=embed, view=betting.BettingView(session_id=session_id))
+    
+    # Auto-lock after 5 minutes
     await asyncio.sleep(300)
-    if db.get_game_state('betting_status') == "OPEN":
-        await close_betting_logic(bot)
+    
+    # Check if THIS specific session is still open
+    conn = db.get_connection()
+    status = conn.execute("SELECT status FROM betting_sessions WHERE session_id=?", (session_id,)).fetchone()
+    conn.close()
+    
+    if status and status[0] == 'OPEN':
+        db.close_session(session_id, status="LOCKED")
+        await ctx.send(f"🔒 **Bets Closed for Round #{session_id}!**\nWaiting for match results...")
 
 @bot.command()
 async def stopbets(ctx):
@@ -608,6 +685,23 @@ async def refresh(ctx):
             count += 1
             
     await status.edit(content=f"✅ **Damage Data Restored!** Rescanned {count} matches.")
+
+@bot.command(name="break")
+async def break_time(ctx, minutes: int):
+    """Usage: !break 5 (Sets a 5 minute timer)"""
+    
+    # Send confirmation
+    end_time = datetime.now() + timedelta(minutes=minutes)
+    time_str = end_time.strftime("%H:%M")
+    
+    await ctx.send(f"☕ **Break Started!**\nWe will be back in **{minutes} minutes** (at {time_str}).")
+    
+    # Wait
+    await asyncio.sleep(minutes * 60)
+    
+    # Announce return
+    await ctx.send(f"🔔 **BREAK OVER!**\n<@&{config.CLAN_ROLE_ID}> Let's get back to the game!") 
+    # (If you don't have a CLAN_ROLE_ID in config, just use @here)
 
 @bot.command()
 async def casino(ctx):

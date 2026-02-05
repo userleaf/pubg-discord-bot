@@ -15,7 +15,79 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS match_stats (pubg_name TEXT, match_id TEXT, stat_key TEXT, value INTEGER, match_date TIMESTAMP, PRIMARY KEY (pubg_name, match_id, stat_key))''')
     c.execute('''CREATE TABLE IF NOT EXISTS wallets (discord_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 1000, last_daily TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS active_bets (bet_id INTEGER PRIMARY KEY AUTOINCREMENT, discord_id INTEGER, bet_type TEXT, target TEXT, amount INTEGER, created_at TIMESTAMP)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS betting_sessions 
+                (session_id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                start_time TIMESTAMP, 
+                status TEXT DEFAULT 'OPEN', 
+                linked_match_id TEXT)''')
+    try:
+        c.execute("SELECT session_id FROM bets LIMIT 1")
+    except:
+        # If this fails, the table is old. Drop and recreate (simplest for dev) 
+        # OR Add column. Let's recreate to be clean since active bets are temporary.
+        c.execute("DROP TABLE IF EXISTS bets")
+        
+    c.execute('''CREATE TABLE IF NOT EXISTS bets 
+                 (bet_id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  session_id INTEGER,
+                  discord_id INTEGER, 
+                  bet_type TEXT, 
+                  target TEXT, 
+                  amount INTEGER,
+                  FOREIGN KEY(session_id) REFERENCES betting_sessions(session_id))''')
+    
     c.execute('''CREATE TABLE IF NOT EXISTS game_state (key TEXT PRIMARY KEY, value TEXT)''')
+    conn.commit()
+    conn.close()
+
+def create_betting_session():
+    """Starts a new round of bets and returns the Session ID"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.utcnow()
+    cursor.execute("INSERT INTO betting_sessions (start_time, status) VALUES (?, 'OPEN')", (now,))
+    session_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return session_id
+
+def get_current_open_session():
+    """Get the session currently accepting bets"""
+    conn = get_connection()
+    # We get the most recent session that is strictly OPEN
+    row = conn.execute("SELECT session_id FROM betting_sessions WHERE status='OPEN' ORDER BY session_id DESC LIMIT 1").fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def get_oldest_unresolved_session():
+    """Finds the oldest session that is waiting for a match result (LOCKED but not RESOLVED)"""
+    conn = get_connection()
+    # FIFO: First In, First Out. The oldest session waiting gets the next match found.
+    row = conn.execute("SELECT session_id, start_time FROM betting_sessions WHERE status='LOCKED' ORDER BY session_id ASC LIMIT 1").fetchone()
+    conn.close()
+    return row # Returns (id, start_time)
+
+def place_bet(session_id, user_id, bet_type, target, amount):
+    conn = get_connection()
+    conn.execute("INSERT INTO bets (session_id, discord_id, bet_type, target, amount) VALUES (?, ?, ?, ?, ?)", 
+                 (session_id, user_id, bet_type, target, amount))
+    conn.commit()
+    conn.close()
+
+def get_bets_for_session(session_id):
+    conn = get_connection()
+    rows = conn.execute("SELECT bet_id, discord_id, bet_type, target, amount FROM bets WHERE session_id=?", (session_id,)).fetchall()
+    conn.close()
+    return rows
+
+def close_session(session_id, match_id=None, status="LOCKED"):
+    """Updates status. OPEN -> LOCKED (Playing) -> RESOLVED (Paid)"""
+    conn = get_connection()
+    if match_id:
+        conn.execute("UPDATE betting_sessions SET status=?, linked_match_id=? WHERE session_id=?", (status, match_id, session_id))
+    else:
+        conn.execute("UPDATE betting_sessions SET status=? WHERE session_id=?", (status, session_id))
     conn.commit()
     conn.close()
 

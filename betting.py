@@ -80,8 +80,9 @@ class PlayerSelectView(View):
         await interaction.response.send_modal(BetAmountModal(self.bet_type, target))
 
 class BettingView(View):
-    def __init__(self):
+    def __init__(self, session_id):
         super().__init__(timeout=None)
+        self.session_id = session_id # <--- IMPORTANT: Store the ID
 
     async def check(self, i):
         if db.get_game_state('betting_status') != "OPEN":
