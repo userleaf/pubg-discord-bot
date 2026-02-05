@@ -344,7 +344,6 @@ async def on_ready():
     bot.add_view(CasinoView())
     if not auto_match_checker.is_running(): auto_match_checker.start()
 
-@tasks.loop(minutes=config.CFG_MINUTES)
 
 @tasks.loop(minutes=config.CFG_MINUTES)
 async def auto_match_checker():
