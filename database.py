@@ -164,44 +164,21 @@ def get_game_state(key):
     with get_connection() as conn:
         res = conn.execute("SELECT value FROM game_state WHERE key=?", (key,)).fetchone()
     return res[0] if res else None
-def get_player_avg_damage(pubg_name):
-    """Calculates average damage over the last 10 tracked matches."""
+
+def get_player_avg_damage(pubg_name, limit=10):
+    """Calculates average damage over the last N tracked matches."""
     with get_connection() as conn:
-        # Get last 10 damage values
+        # We fetch the rows where the stat is explicitly 'damage_dealt'
+        # This uses the table structure you ALREADY have.
         rows = conn.execute('''
             SELECT value FROM match_stats 
             WHERE pubg_name=? AND stat_key='damage_dealt' 
-            ORDER BY match_date DESC LIMIT 10
-        ''', (pubg_name,)).fetchall()
+            ORDER BY match_date DESC LIMIT ?
+        ''', (pubg_name, limit)).fetchall()
     
     if not rows: return 0
     total = sum(r[0] for r in rows)
-    return total / len(rows)
-
-def get_player_avg_damage(player_name, limit=10):
-    conn = get_connection()
-    # We look at the JSON stats stored in match_stats
-    cursor = conn.execute("SELECT stats_json FROM match_stats ORDER BY match_date DESC LIMIT 50")
-    rows = cursor.fetchall()
-    conn.close()
-
-    total_dmg = 0
-    count = 0
-    
-    import json
-    for (json_data,) in rows:
-        if count >= limit: break
-        try:
-            stats = json.loads(json_data)
-            # Check if this player was in this specific match
-            if player_name in stats:
-                total_dmg += stats[player_name].get('damage_dealt', 0)
-                count += 1
-        except:
-            continue
-            
-    if count == 0: return 0
-    return int(total_dmg / count)
+    return int(total / len(rows))
 
 def check_daily_available(user_id):
     conn = get_connection()
