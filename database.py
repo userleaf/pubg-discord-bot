@@ -204,3 +204,10 @@ def check_daily_available(user_id):
     except Exception as e:
         print(f"Date Error: {e}")
         return True
+
+def get_session_status(session_id):
+    """Returns the status (OPEN/LOCKED/RESOLVED) of a specific session."""
+    conn = get_connection()
+    row = conn.execute("SELECT status FROM betting_sessions WHERE session_id=?", (session_id,)).fetchone()
+    conn.close()
+    return row[0] if row else "CLOSED"

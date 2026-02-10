@@ -44,81 +44,86 @@ class PvPOpponentSelectView(View):
         # passing the constructed bet_type string like "PVP_DMG:OpponentName"
         await interaction.response.send_modal(BetAmountModal(f"DUEL ({ratio}x)", f"vs {opponent}"))
 
-class BetAmountModal(Modal):
-    def __init__(self, bet_type, target):
-        super().__init__(title=f"Bet on {bet_type}")
+import discord
+import database as db
+
+class BettingModal(discord.ui.Modal):
+    def __init__(self, session_id, bet_type, title, placeholder="Amount"):
+        super().__init__(title=title)
+        self.session_id = session_id # Store the session ID
         self.bet_type = bet_type
-        self.target = target
-        self.amount = TextInput(label="Amount", placeholder="100", min_length=1, max_length=5)
+        
+        self.amount = discord.ui.TextInput(
+            label="Bet Amount", 
+            placeholder=placeholder,
+            min_length=1, 
+            max_length=6
+        )
         self.add_item(self.amount)
 
+        # For specific targets (like "Who will die first?"), add a second input
+        self.target = None
+        if bet_type in ["MOST_DMG", "FIRST_DIE", "DUEL"]:
+            self.target = discord.ui.TextInput(
+                label="Player Name",
+                placeholder="Exact PUBG Name",
+                min_length=3,
+                max_length=20
+            )
+            self.add_item(self.target)
+
     async def on_submit(self, interaction: discord.Interaction):
+        # 1. Validate Amount
         try:
             amt = int(self.amount.value)
             if amt <= 0: raise ValueError
         except:
-            await interaction.response.send_message("❌ Invalid amount.", ephemeral=True)
-            return
+            return await interaction.response.send_message("❌ Please enter a valid positive number.", ephemeral=True)
+
+        # 2. Check Balance
+        user_id = interaction.user.id
+        balance = db.get_balance(user_id)
+        if balance < amt:
+            return await interaction.response.send_message(f"❌ **Insufficient Funds!** You have {balance} coins.", ephemeral=True)
+
+        # 3. Check Session Status (The Fix)
+        # We check if THIS specific session is still OPEN
+        status = db.get_session_status(self.session_id)
+        if status != "OPEN":
+            return await interaction.response.send_message(f"🔒 **Betting is CLOSED** for Round #{self.session_id}!", ephemeral=True)
+
+        # 4. Place Bet
+        target_val = self.target.value if self.target else "SQUAD"
         
-        if db.place_bet(interaction.user.id, self.bet_type, self.target, amt):
-            await interaction.response.send_message(f"✅ **Bet Placed:** {amt} coins on {self.bet_type} ({self.target})", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"❌ Broke! You have {db.get_balance(interaction.user.id)} coins.", ephemeral=True)
+        # Deduct Money
+        db.update_balance(user_id, -amt)
+        
+        # Save to DB
+        db.place_bet(self.session_id, user_id, self.bet_type, target_val, amt)
+        
+        await interaction.response.send_message(f"✅ **Bet Placed!** {amt} on {self.bet_type} (Round #{self.session_id})", ephemeral=True)
 
-class PlayerSelectView(View):
-    def __init__(self, bet_type, players):
-        super().__init__()
-        # Ensure we only take first 25 players to fit Discord limit
-        options = [discord.SelectOption(label=p, description="Clan Member") for p in players[:25]]
-        select = Select(placeholder="Select a Player...", options=options)
-        select.callback = self.callback
-        self.bet_type = bet_type
-        self.add_item(select)
-    
-    async def callback(self, interaction: discord.Interaction):
-        target = interaction.data['values'][0]
-        await interaction.response.send_modal(BetAmountModal(self.bet_type, target))
 
-class BettingView(View):
+class BettingView(discord.ui.View):
     def __init__(self, session_id):
         super().__init__(timeout=None)
-        self.session_id = session_id # <--- IMPORTANT: Store the ID
+        self.session_id = session_id
 
-    async def check(self, i):
-        if db.get_game_state('betting_status') != "OPEN":
-            await i.response.send_message("❌ Betting Closed.", ephemeral=True)
-            return False
-        return True
+    @discord.ui.button(label="🏆 Win (10x)", style=discord.ButtonStyle.primary, row=0)
+    async def bet_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BettingModal(self.session_id, "WIN", "Bet on Win"))
 
-    @discord.ui.button(label="🍗 Win (x10)", style=discord.ButtonStyle.green, emoji="🍗")
-    async def b_win(self, i: discord.Interaction, b: Button):
-        if await self.check(i): await i.response.send_modal(BetAmountModal("WIN", "Squad"))
+    @discord.ui.button(label="🔟 Top 10 (2x)", style=discord.ButtonStyle.success, row=0)
+    async def bet_top10(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BettingModal(self.session_id, "TOP10", "Bet on Top 10"))
 
-    @discord.ui.button(label="🔟 Top 10 (x2)", style=discord.ButtonStyle.primary, emoji="🔟")
-    async def b_top10(self, i: discord.Interaction, b: Button):
-        if await self.check(i): await i.response.send_modal(BetAmountModal("TOP10", "Squad"))
+    @discord.ui.button(label="💀 First Die (3x)", style=discord.ButtonStyle.danger, row=1)
+    async def bet_die(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BettingModal(self.session_id, "FIRST_DIE", "Who dies first?"))
 
-    @discord.ui.button(label="💀 First Die (x3)", style=discord.ButtonStyle.danger, emoji="💀")
-    async def b_die(self, i: discord.Interaction, b: Button):
-        if await self.check(i):
-            # Fetch players from DB to populate dropdown
-            # We need to access DB via the module
-            import sqlite3
-            conn = sqlite3.connect('clan.db')
-            players = [r[0] for r in conn.execute("SELECT pubg_name FROM players").fetchall()]
-            conn.close()
-            if not players: await i.response.send_message("❌ No players registered.", ephemeral=True)
-            else: await i.response.send_message("Who will die first?", view=PlayerSelectView("FIRST_DIE", players), ephemeral=True)
-
-    @discord.ui.button(label="💥 Most Dmg (x3)", style=discord.ButtonStyle.secondary, emoji="💥")
-    async def b_dmg(self, i: discord.Interaction, b: Button):
-        if await self.check(i):
-            import sqlite3
-            conn = sqlite3.connect('clan.db')
-            players = [r[0] for r in conn.execute("SELECT pubg_name FROM players").fetchall()]
-            conn.close()
-            if not players: await i.response.send_message("❌ No players registered.", ephemeral=True)
-            else: await i.response.send_message("Who will deal most damage?", view=PlayerSelectView("MOST_DMG", players), ephemeral=True)
+    @discord.ui.button(label="💥 Most Dmg (3x)", style=discord.ButtonStyle.secondary, row=1)
+    async def bet_dmg(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BettingModal(self.session_id, "MOST_DMG", "Most Damage"))
     @discord.ui.button(label="⚔️ 1v1 Duel", style=discord.ButtonStyle.secondary, emoji="⚔️")
     async def b_pvp(self, i: discord.Interaction, b: Button):
         if await self.check(i):
